@@ -1,182 +1,120 @@
 package main
 
 import (
-	"bufio"
-	"context"
-	"flag"
 	"fmt"
-	"io/fs"
-	"log"
-	"os"
-	"path/filepath"
-	"strings"
 
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/cdproto/runtime"
-	"github.com/chromedp/chromedp"
-	"github.com/graniticio/inifile"
+	"github.com/gogap/aop"
 )
 
-var (
-	dir string
-)
+type Auth struct {
+}
+
+func (p *Auth) Login(userName, password string) bool {
+	fmt.Println("@Login", userName, password)
+	if userName == "zeal" && password == "gogap" {
+		return true
+	}
+	return false
+}
+
+// use join point to get Args from real method
+func (p *Auth) Before(jp aop.JoinPointer) {
+	username := ""
+	jp.Args().MapTo(func(u, p string) {
+		username = u
+	})
+
+	fmt.Printf("Before Login: %s\n", username)
+}
+
+// the args is same as Login
+func (p *Auth) After(username, password string) {
+	fmt.Printf("After Login: %s %s\n", username, password)
+}
+
+// use join point to around the real func of login
+func (p *Auth) Around(pjp aop.ProceedingJoinPointer) {
+	fmt.Println("@Begin Around")
+
+	ret := pjp.Proceed("fakeName", "fakePassword")
+	ret.MapTo(func(loginResult bool) {
+		fmt.Println("@Proceed Result is", loginResult)
+	})
+
+	fmt.Println("@End Around")
+}
+
+type Foo struct {
+}
+
+// @AfterReturning, the method could have args of aop.Result,
+// it will get the result from real func return values
+func (p *Foo) Bar(result aop.Result) {
+	result.MapTo(func(v bool) {
+		fmt.Println("Bar Bar Bar .... Result is:", v)
+	})
+}
 
 func main() {
-	flag.StringVar(&dir, "dir", "", "Absolute path for target directory")
+	beanFactory := aop.NewClassicBeanFactory()
+	beanFactory.RegisterBean("auth", new(Auth))
+	beanFactory.RegisterBean("foo", new(Foo))
 
-	flag.Parse()
-	if len(dir) < 1 {
-		log.Fatal("No --dir is given")
+	aspect := aop.NewAspect("aspect_1", "auth")
+	aspect.SetBeanFactory(beanFactory)
+
+	aspectFoo := aop.NewAspect("aspect_2", "foo")
+	aspectFoo.SetBeanFactory(beanFactory)
+
+	pointcut := aop.NewPointcut("pointcut_1").Execution(`Login()`)
+	pointcut.Execution(`Login()`)
+
+	aspect.AddPointcut(pointcut)
+	aspectFoo.AddPointcut(pointcut)
+
+	aspect.AddAdvice(&aop.Advice{Ordering: aop.Before, Method: "Before", PointcutRefID: "pointcut_1"})
+	aspect.AddAdvice(&aop.Advice{Ordering: aop.After, Method: "After", PointcutRefID: "pointcut_1"})
+	aspect.AddAdvice(&aop.Advice{Ordering: aop.Around, Method: "Around", PointcutRefID: "pointcut_1"})
+	aspectFoo.AddAdvice(&aop.Advice{Ordering: aop.AfterReturning, Method: "Bar", PointcutRefID: "pointcut_1"})
+
+	gogapAop := aop.NewAOP()
+	gogapAop.SetBeanFactory(beanFactory)
+	gogapAop.AddAspect(aspect)
+	gogapAop.AddAspect(aspectFoo)
+
+	var err error
+	var proxy *aop.Proxy
+
+	// Get proxy
+	if proxy, err = gogapAop.GetProxy("auth"); err != nil {
+		fmt.Println("get proxy failed", err)
+		return
 	}
 
-	urlFiles := Scan(dir, ".url")
-	urlFilesLen := len(urlFiles)
-	if urlFilesLen < 1 {
-		log.Fatal("No .url file found")
-	}
-	fmt.Printf("There are %d url files\n", len(urlFiles))
+	// start trace for debug
+	aop.StartTrace()
 
-	file, err := os.Create(fmt.Sprintf("%s.txt", getFolderName(dir)))
-	errExit(err)
-	defer file.Close()
-	w := bufio.NewWriter(file)
+	fmt.Println("==========Func Type Assertion==========")
 
-	for _, s := range urlFiles {
-		ic, err := inifile.NewIniConfigFromPath(s)
-		errExit(err)
-		url, err := ic.Value("InternetShortcut", "URL")
-		errExit(err)
-		fmt.Println("checking", url, ", in", s, "...")
-		protocol := url[0:strings.Index(url, `://`)]
-		if protocol == `http` || protocol == `https` {
-			title, err := getTitle(url)
-			errExit(err)
-			fmt.Fprintf(w, "- [%s](%s)\n", title, url)
-		} else {
-			fmt.Fprintf(w, "- [%s](%s)\n", url, url)
-		}
-	}
-	errExit(w.Flush())
+	login := proxy.Method(new(Auth).Login).(func(string, string) bool)("zeal", "gogap")
 
-	// for _, s := range urlFiles {
-	// 	errExit(os.Remove(s))
-	// }
-}
+	fmt.Println("Login result:", login)
 
-func errExit(err error) {
-	if err != nil {
-		log.Fatal(err)
-	}
-}
+	fmt.Println("================Invoke=================")
 
-func Scan(root, ext string) []string {
-	var a []string
-	filepath.WalkDir(root, func(s string, d fs.DirEntry, e error) error {
-		if e != nil {
-			return e
-		}
-		if filepath.Ext(d.Name()) == ext {
-			a = append(a, s)
-		}
-		return nil
-	})
-	return a
-}
-
-func getTitle(urlstr string) (string, error) {
-	ctx, cancel := chromedp.NewContext(context.Background())
-	defer cancel()
-	var title string
-
-	chromedp.ListenTarget(ctx, func(ev interface{}) {
-
-		switch ev := ev.(type) {
-
-		case *network.EventResponseReceived:
-			resp := ev.Response
-			if resp.URL == urlstr {
-				log.Printf("received headers: %s %s", resp.URL, resp.MimeType)
-				if resp.MimeType != "text/html" {
-					chromedp.Cancel(ctx)
-				}
-
-				if strings.Contains(resp.URL, "youtube.com") {
-					log.Printf("YT!!")
-				}
-
-				// may be redirected
-				switch ContentType := resp.Headers["Content-Type"].(type) {
-				case string:
-					// here v has type T
-					if !strings.Contains(ContentType, "text/html") {
-						chromedp.Cancel(ctx)
-					}
-				}
-
-				switch ContentType := resp.Headers["content-type"].(type) {
-				case string:
-					// here v has type T
-					if !strings.Contains(ContentType, "text/html") {
-						chromedp.Cancel(ctx)
-					}
-				}
-			}
-		}
-	})
-
-	req := `
-(async () => new Promise((resolve, reject) => {
-	var handle = NaN;
-
-	(function animate() {
-		if (!isNaN(handle)) {
-			clearTimeout(handle);
-		}
-
-		if (document.title.length > 0 && !document.title.startsWith("http")) {
-			resolve(document.title);
-		} else {
-			handle = setTimeout(animate, 1000);
-		}
-	}());
-}));
-`
-	err := chromedp.Run(ctx,
-		chromedp.Navigate(urlstr),
-		//chromedp.Evaluate(`window.location.href`, &res),
-		chromedp.Evaluate(req, nil, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
-			return p.WithAwaitPromise(true)
-		}),
-		chromedp.Title(&title),
-	)
-	if err == context.Canceled {
-		// url as title
-		log.Printf("Cancel!!")
-		return urlstr, nil
-	}
-
-	return title, err
-}
-
-// fmt.Println(getFolderName(`P`))           //P
-// fmt.Println(getFolderName(`P:`))          //P
-// fmt.Println(getFolderName(`P:\`))         //P
-// fmt.Println(getFolderName(`P:\testing`))  //testing
-// fmt.Println(getFolderName(`P:\testing\`)) //testing
-func getFolderName(input string) string {
-	var folderName string
-	lastIndex := strings.LastIndex(input, `\`)
-	length := len(input)
-	if lastIndex+1 == length {
-		lastIndex = strings.LastIndex(input[0:length-1], `\`)
-		folderName = input[lastIndex+1 : length-1]
+	if err = proxy.Invoke(new(Auth).Login, "zeal", "errorpassword").End(
+		func(result bool) {
+			login = result
+		}); err != nil {
+		fmt.Println("invoke proxy func error", err)
 	} else {
-		folderName = input[lastIndex+1 : length]
+		fmt.Println("Login result:", login)
 	}
 
-	if folderName[len(folderName)-1:] == ":" {
-		return folderName[0 : len(folderName)-1]
-	} else {
-		return folderName
+	t, _ := aop.StopTrace()
+
+	// print trace result
+	for _, item := range t.Items() {
+		fmt.Println(item.ID, item.InvokeID, item.BeanRefID, item.Pointcut, item.Method)
 	}
 }
